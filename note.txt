@@ -1,0 +1,343 @@
+// File: server.js
+const express = require('express');
+const mongoose = require('mongoose');
+const http = require('http');
+const { Server } = require('colyseus');
+const cors = require('cors');
+const dotenv = require('dotenv');
+const authRoutes = require('./routes/auth');
+const userRoutes = require('./routes/users');
+const messageRoutes = require('./routes/messages');
+const ChatRoom = require('./rooms/ChatRoom');
+
+dotenv.config();
+
+const app = express();
+const server = http.createServer(app);
+const gameServer = new Server({
+  server: server
+});
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// Database connection
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+}).then(() => {
+  console.log('Connected to MongoDB');
+}).catch((err) => {
+  console.error('MongoDB connection error:', err);
+});
+
+// Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/messages', messageRoutes);
+
+// Register Colyseus room
+gameServer.define('chat', ChatRoom);
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+// File: models/User.js
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+const userSchema = new mongoose.Schema({
+  username: {
+    type: String,
+    required: true,
+    unique: true,
+    trim: true
+  },
+  email: {
+    type: String,
+    required: true,
+    unique: true,
+    trim: true
+  },
+  password: {
+    type: String,
+    required: true
+  },
+  conversations: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Conversation'
+  }]
+}, { timestamps: true });
+
+userSchema.pre('save', async function(next) {
+  if (this.isModified('password')) {
+    this.password = await bcrypt.hash(this.password, 10);
+  }
+  next();
+});
+
+userSchema.methods.comparePassword = async function(candidatePassword) {
+  return bcrypt.compare(candidatePassword, this.password);
+};
+
+module.exports = mongoose.model('User', userSchema);
+
+// File: models/Message.js
+const mongoose = require('mongoose');
+
+const messageSchema = new mongoose.Schema({
+  conversation: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Conversation',
+    required: true
+  },
+  sender: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  content: {
+    type: String,
+    required: true
+  },
+  read: {
+    type: Boolean,
+    default: false
+  }
+}, { timestamps: true });
+
+module.exports = mongoose.model('Message', messageSchema);
+
+// File: models/Conversation.js
+const mongoose = require('mongoose');
+
+const conversationSchema = new mongoose.Schema({
+  participants: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  }],
+  lastMessage: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Message'
+  }
+}, { timestamps: true });
+
+module.exports = mongoose.model('Conversation', conversationSchema);
+
+// File: middleware/auth.js
+const jwt = require('jsonwebtoken');
+
+module.exports = async (req, res, next) => {
+  try {
+    const token = req.header('Authorization').replace('Bearer ', '');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.userId = decoded.userId;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Please authenticate' });
+  }
+};
+
+// File: routes/auth.js
+const express = require('express');
+const router = express.Router();
+const User = require('../models/User');
+const jwt = require('jsonwebtoken');
+
+router.post('/register', async (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+    const user = new User({ username, email, password });
+    await user.save();
+    
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET);
+    res.status(201).json({ token, user: { id: user._id, username: user.username, email: user.email } });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await User.findOne({ email });
+    if (!user || !(await user.comparePassword(password))) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET);
+    res.json({ token, user: { id: user._id, username: user.username, email: user.email } });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+module.exports = router;
+
+// File: routes/users.js
+const express = require('express');
+const router = express.Router();
+const User = require('../models/User');
+const auth = require('../middleware/auth');
+
+router.get('/search', auth, async (req, res) => {
+  try {
+    const { query } = req.query;
+    const users = await User.find({
+      $or: [
+        { username: { $regex: query, $options: 'i' } },
+        { email: { $regex: query, $options: 'i' } }
+      ],
+      _id: { $ne: req.userId }
+    }).select('-password');
+    res.json(users);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+module.exports = router;
+
+// File: routes/messages.js
+const express = require('express');
+const router = express.Router();
+const Message = require('../models/Message');
+const Conversation = require('../models/Conversation');
+const auth = require('../middleware/auth');
+
+router.post('/conversations', auth, async (req, res) => {
+  try {
+    const { participantId } = req.body;
+    let conversation = await Conversation.findOne({
+      participants: { $all: [req.userId, participantId] }
+    });
+
+    if (!conversation) {
+      conversation = new Conversation({
+        participants: [req.userId, participantId]
+      });
+      await conversation.save();
+    }
+
+    res.json(conversation);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.get('/conversations', auth, async (req, res) => {
+  try {
+    const conversations = await Conversation.find({
+      participants: req.userId
+    })
+    .populate('participants', 'username email')
+    .populate('lastMessage');
+    res.json(conversations);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.get('/conversations/:conversationId/messages', auth, async (req, res) => {
+  try {
+    const messages = await Message.find({
+      conversation: req.params.conversationId
+    })
+    .populate('sender', 'username')
+    .sort({ createdAt: -1 })
+    .limit(50);
+    res.json(messages.reverse());
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+module.exports = router;
+
+// File: rooms/ChatRoom.js
+const { Room } = require('colyseus');
+const Message = require('../models/Message');
+const Conversation = require('../models/Conversation');
+
+const formatMessage = require('../helper/index'); // Adjust path if necessary
+
+const { Room } = require('colyseus');
+const Message = require('../models/Message');
+const Conversation = require('../models/Conversation');
+class ChatRoom extends Room {
+    onCreate(options) {
+        this.conversationId = null;
+
+        this.onMessage('message', async (client, message) => {
+            try {
+                const newMessage = new Message({
+                    conversation: this.conversationId,
+                    sender: message.senderId,
+                    content: message.content
+                });
+                await newMessage.save();
+
+                // Populate the sender information
+                await newMessage.populate('sender', '_id username');
+
+                await Conversation.findByIdAndUpdate(this.conversationId, {
+                    lastMessage: newMessage._id
+                });
+
+                // Format the message consistently before broadcasting
+                const formattedMessage = formatMessage(newMessage);
+
+                // Broadcast formatted message to all clients in the room
+                this.broadcast('message', formattedMessage);
+            } catch (err) {
+                console.error('Error saving message:', err);
+                client.send('error', { message: 'Failed to save message' });
+            }
+        });
+
+        this.onMessage('typing', (client, data) => {
+            this.broadcast('typing', {
+                userId: data.userId,
+                isTyping: data.isTyping
+            }, { except: client });
+        });
+    }
+
+    onJoin(client, options) {
+        if (!this.conversationId && options.conversationId) {
+            this.conversationId = options.conversationId;
+        }
+
+        client.userData = {
+            userId: options.userId
+        };
+
+        this.broadcast('userJoined', {
+            userId: options.userId,
+            sessionId: client.sessionId
+        }, { except: client });
+
+        console.log(`Client ${client.sessionId} joined conversation ${this.conversationId}`);
+    }
+
+    onLeave(client, consented) {
+        this.broadcast('userLeft', {
+            userId: client.userData?.userId,
+            sessionId: client.sessionId
+        });
+
+        console.log(`Client ${client.sessionId} left the room`);
+    }
+
+    onDispose() {
+        console.log(`Room ${this.roomId} disposing...`);
+    }
+}
+
+module.exports = ChatRoom;
+
+module.exports = ChatRoom;
